@@ -1,7 +1,8 @@
 from __future__ import annotations
 from typing import Callable
-
+from functools import lru_cache
 import tomli, os
+
 
 LAYOUT_DIR = 'layouts'
 TEMPLATE_FN = str.format
@@ -13,12 +14,17 @@ FRONTMATTER_PARSER = tomli.loads
 CONFIG_PARSER = tomli.loads
 CONFIG_NAME = 'config.toml'
 
+CACHE_SIZE = 128
+
 
 class Path(str):
     """Wraps a `str` and provides some utility methods for path manipulation."""
 
     def __init__(self, *args) -> None:
         super().__init__()
+
+        self.dir, self.filename = os.path.split(self)
+        self.basename, self.ext = os.path.splitext(self.filename)
     
     def swap_root(self, old_root: str, new_root: str):
         """
@@ -43,7 +49,6 @@ class Path(str):
         """
 
         return Path(os.path.splitext(self)[0] + new_ext)
-
 
 class File:
     """Represents a buildable file"""
@@ -100,7 +105,7 @@ class FrontMatterFile(File):
     
     def template(self, vars: dict) -> str:
         """Templates the body using variables in the frontmatter"""
-        return TEMPLATE_FN(self.body, **vars, **self.frontmatter)
+        return TEMPLATE_FN(self.body, **{**vars, **self.frontmatter})
 
     @property
     def frontmatter(self) -> dict:
@@ -139,14 +144,16 @@ class DirIndex:
 
         for entry in os.scandir(self.path):
             if entry.is_file():
-                yield FrontMatterFile(entry.path, *self.args, **self.kwargs)
+                yield FILE_FN(entry.path, *self.args, **self.kwargs)
 
             elif entry.is_dir():
-                yield DirIndex(entry.path, *self.args, **self.kwargs)
+                yield DIR_FN(entry.path, *self.args, **self.kwargs)
 
     def __iter__(self):
         return self.items()
 
+FILE_FN = lru_cache()(FrontMatterFile)
+DIR_FN = lru_cache()(DirIndex)
 
 class Iter:
     """Provides utility functions for working with a `DirIndex`"""
@@ -158,7 +165,7 @@ class Iter:
     @staticmethod
     def from_dir(dir: str) -> Iter:
         """Constructs an `Iter` from a directory path"""
-        return Iter(DirIndex(dir))
+        return Iter(DIR_FN(dir))
 
     def files(self) -> Iter:
         """Filters the items of the iterator, so that it contains only files"""
@@ -220,7 +227,7 @@ def load_layout(name) -> FrontMatterFile:
     path = os.path.join(LAYOUT_DIR, name)
 
     if os.path.isfile(path):
-        return FrontMatterFile(path)
+        return FILE_FN(path)
 
     raise Exception("Layout {} does not exist".format(name))
 
@@ -253,3 +260,23 @@ def is_file(obj):
 def is_dir(obj):
     """Returns True if the object is a `DirIndex`"""
     return isinstance(obj, DirIndex)
+
+
+def recursive_layout(file: FrontMatterFile, vars: dict) -> tuple[str, str]:
+    templated = file.template(vars)
+    layout = file.frontmatter.get('layout', vars.get('layout'))
+
+    if not layout:
+        if 'page' in vars:
+            return vars['page']['content'], templated
+
+        return templated, templated
+
+    layout = load_layout(layout)
+    layout_vars = {
+        **vars,
+        'page': {**file.frontmatter, 'content': templated},
+        'layout': layout.frontmatter.get('content')
+    }
+
+    return recursive_layout(layout, layout_vars)
